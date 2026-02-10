@@ -156,19 +156,59 @@ class PDFtoCSVConverter:
 
         return df
 
+    def _flatten_multirow_header(self, df: pd.DataFrame, max_header_rows: int = 3) -> pd.DataFrame:
+        """
+        If the first 2–3 rows look like header fragments, merge them into one header row.
+        Example: stacked 'Gen', 'der', '(M/F/O)' → 'Gen der (M/F/O)'.
+        """
+        if df.empty or len(df) < 2:
+            return df
+
+        header_block = df.head(max_header_rows)
+
+        # If top row is mostly empty/NaN (title band), drop it
+        if header_block.iloc[0].isna().mean() > 0.7:
+            df = df.iloc[1:].reset_index(drop=True)
+            header_block = df.head(max_header_rows)
+            if df.empty:
+                return df
+
+        # Decide how many top rows to treat as header fragments
+        non_nan_counts = header_block.notna().sum(axis=1)
+        # Heuristic: at least 2 rows near the top are header-like
+        header_rows = header_block.index.tolist()
+        if len(header_rows) <= 1:
+            return df
+
+        parts = df.iloc[header_rows].astype(str).fillna("").applymap(str.strip)
+        new_cols = []
+        for col_idx in range(parts.shape[1]):
+            tokens = [t for t in parts.iloc[:, col_idx].tolist() if t and t.lower() != "nan"]
+            col_name = " ".join(tokens).strip()
+            new_cols.append(col_name or f"col_{col_idx}")
+
+        # Drop the header rows and assign combined header
+        df = df.iloc[len(header_rows):].reset_index(drop=True)
+        df.columns = new_cols
+        return df
+
     def clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Basic cleanup: remove duplicate headers, empty rows/cols, trim text."""
+        """Cleanup + fix stacked headers like in the screenshot."""
+        # First, try to flatten multi‑row headers
+        df = self._flatten_multirow_header(df)
+
+        # Remove duplicate header rows that may still remain
         df = self.remove_duplicate_headers(df)
 
-        # drop all‑NaN rows/cols
+        # Drop all‑NaN rows/cols
         df = df.dropna(how="all").dropna(axis=1, how="all")
 
-        # drop rows that are all empty strings
+        # Drop rows that are all empty strings
         df = df[
             ~df.apply(lambda row: all(str(val).strip() == "" for val in row), axis=1)
         ]
 
-        # normalize every column to stripped strings (no .dtype, no .str)
+        # Normalize all cells to stripped strings
         for col in df.columns:
             df[col] = df[col].apply(lambda v: str(v).strip())
             df[col] = df[col].replace("nan", "")
