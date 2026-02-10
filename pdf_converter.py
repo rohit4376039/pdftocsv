@@ -251,9 +251,17 @@ class PDFtoCSVConverter:
         safe_dfs: List[pd.DataFrame] = []
         for df in dfs:
             df = df.copy()
-            # make columns unique: col, col.1, col.2, ...
-            parser = pd.io.parsers.ParserBase({})
-            df.columns = parser._maybe_dedup_names(list(df.columns))
+            counts = {}
+            new_cols = []
+            for col in df.columns:
+                col_str = str(col)
+                if col_str not in counts:
+                    counts[col_str] = 0
+                    new_cols.append(col_str)
+                else:
+                    counts[col_str] += 1
+                    new_cols.append(f"{col_str}.{counts[col_str]}")
+            df.columns = new_cols
             safe_dfs.append(df)
         dfs = safe_dfs
 
