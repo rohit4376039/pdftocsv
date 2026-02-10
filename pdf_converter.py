@@ -247,6 +247,16 @@ class PDFtoCSVConverter:
             dfs = [self.clean_dataframe(df) for df in dfs if not df.empty]
             dfs = [df for df in dfs if not df.empty]
 
+        # ensure unique column names in each df before any concat
+        safe_dfs: List[pd.DataFrame] = []
+        for df in dfs:
+            df = df.copy()
+            # make columns unique: col, col.1, col.2, ...
+            parser = pd.io.parsers.ParserBase({})
+            df.columns = parser._maybe_dedup_names(list(df.columns))
+            safe_dfs.append(df)
+        dfs = safe_dfs
+
         base = pdf_path.stem
 
         if merge and len(dfs) > 1:
