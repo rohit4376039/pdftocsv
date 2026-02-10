@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 import logging
 
 # Configure logging
@@ -60,54 +60,54 @@ class PDFtoCSVConverter:
             return []
     
     def extract_with_pdfplumber(self, pdf_path: str) -> List[pd.DataFrame]:
-        """Extract tables using Pdfplumber with improved multi-page handling."""
+        """Extract tables using Pdfplumber with streaming + multi-page handling."""
         try:
             import pdfplumber
             
-            logger.info(f"Extracting with Pdfplumber from {pdf_path}")
-            all_tables = []
-            
+            logger.info(f"Extracting with Pdfplumber (streaming) from {pdf_path}")
+            all_tables: List[pd.DataFrame] = []
+            current_table_data = []
+            current_headers = None
+
             with pdfplumber.open(pdf_path) as pdf:
-                current_table_data = []
-                current_headers = None
-                
                 for page_num, page in enumerate(pdf.pages, 1):
                     tables = page.extract_tables()
-                    
+
                     for table in tables:
                         if not table or len(table) == 0:
                             continue
-                        
-                        # Check if this is a continuation of previous table
-                        potential_headers = [str(cell).strip().lower() for cell in table[0]]
-                        
+
                         if current_headers is None:
-                            # First table - set headers
+                            # First table
                             current_headers = table[0]
                             current_table_data = table[1:]
                             logger.info(f"Started new table on page {page_num} with {len(table[0])} columns")
-                        
                         elif self._is_same_table(current_headers, table[0]):
-                            # Same table continuing - skip header row and append data
+                            # Same table continues – append only data rows
                             current_table_data.extend(table[1:])
-                            logger.info(f"Continued table on page {page_num}, added {len(table)-1} rows")
-                        
+                            logger.info(f"Continued table on page {page_num}, added {len(table) - 1} rows")
                         else:
-                            # Different table - save previous and start new one
+                            # Different table – flush current and start new
                             if current_table_data:
                                 df = pd.DataFrame(current_table_data, columns=current_headers)
                                 all_tables.append(df)
                                 logger.info(f"Completed table with {len(current_table_data)} rows")
-                            
+
                             current_headers = table[0]
                             current_table_data = table[1:]
                             logger.info(f"Started new table on page {page_num}")
-                
-                # Don't forget the last table
-                if current_table_data and current_headers:
-                    df = pd.DataFrame(current_table_data, columns=current_headers)
-                    all_tables.append(df)
-                    logger.info(f"Completed final table with {len(current_table_data)} rows")
+
+                    # free memory for this page
+                    try:
+                        page.flush_cache()
+                    except Exception:
+                        pass
+
+            # Flush last table
+            if current_table_data and current_headers:
+                df = pd.DataFrame(current_table_data, columns=current_headers)
+                all_tables.append(df)
+                logger.info(f"Completed final table with {len(current_table_data)} rows")
             
             logger.info(f"Pdfplumber extracted {len(all_tables)} tables total")
             return all_tables
@@ -121,41 +121,34 @@ class PDFtoCSVConverter:
         Check if two header rows belong to the same table.
         Returns True if they match (indicating table continuation across pages).
         """
-        # Normalize headers for comparison
         h1 = [str(h).strip().lower() for h in headers1]
         h2 = [str(h).strip().lower() for h in headers2]
         
-        # Must have same number of columns
         if len(h1) != len(h2):
             return False
         
-        # Check if headers match (allowing for minor variations)
-        matches = sum(1 for a, b in zip(h1, h2) if a == b or 
-                     (a in b or b in a) and len(a) > 2 and len(b) > 2)
+        matches = sum(
+            1 for a, b in zip(h1, h2)
+            if a == b or ((a in b or b in a) and len(a) > 2 and len(b) > 2)
+        )
         
-        # Consider it the same table if 70% or more headers match
-        similarity = matches / len(h1)
+        similarity = matches / len(h1) if h1 else 0
         return similarity >= 0.7
     
     def remove_duplicate_headers(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Remove rows that are duplicate headers within the dataframe.
-        This handles cases where headers appear in the middle of data.
         """
         if df.empty:
             return df
         
-        # Get the actual header
         header_values = [str(col).strip().lower() for col in df.columns]
         
-        # Find rows that match the header
         rows_to_drop = []
         for idx, row in df.iterrows():
             row_values = [str(val).strip().lower() for val in row]
-            
-            # Check if this row matches the header
             matches = sum(1 for a, b in zip(header_values, row_values) if a == b)
-            if matches >= len(header_values) * 0.7:  # 70% match
+            if header_values and matches / len(header_values) >= 0.7:
                 rows_to_drop.append(idx)
         
         if rows_to_drop:
@@ -166,25 +159,18 @@ class PDFtoCSVConverter:
     
     def clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean extracted DataFrame with improved multi-page handling."""
-        # Remove duplicate header rows first
         df = self.remove_duplicate_headers(df)
         
-        # Remove completely empty rows and columns
         df = df.dropna(how='all').dropna(axis=1, how='all')
         
-        # Remove rows where all values are empty strings
         df = df[~df.apply(lambda row: all(str(val).strip() == '' for val in row), axis=1)]
         
-        # Strip whitespace from string columns
         for col in df.columns:
             if df[col].dtype == 'object':
                 df[col] = df[col].astype(str).str.strip()
-                # Replace 'nan' strings with empty strings
                 df[col] = df[col].replace('nan', '')
         
-        # Reset index
         df = df.reset_index(drop=True)
-        
         return df
     
     def merge_similar_tables(self, dataframes: List[pd.DataFrame]) -> List[pd.DataFrame]:
@@ -195,19 +181,17 @@ class PDFtoCSVConverter:
         if len(dataframes) <= 1:
             return dataframes
         
-        merged = []
+        merged: List[pd.DataFrame] = []
         current_group = [dataframes[0]]
         current_columns = set(str(col).strip().lower() for col in dataframes[0].columns)
         
         for df in dataframes[1:]:
             df_columns = set(str(col).strip().lower() for col in df.columns)
             
-            # Check if columns match
             if df_columns == current_columns:
                 current_group.append(df)
-                logger.info(f"Grouping table with matching columns")
+                logger.info("Grouping table with matching columns")
             else:
-                # Different structure - merge current group and start new one
                 if len(current_group) > 1:
                     logger.info(f"Merging {len(current_group)} tables with same structure")
                     merged_df = pd.concat(current_group, ignore_index=True)
@@ -218,7 +202,6 @@ class PDFtoCSVConverter:
                 current_group = [df]
                 current_columns = df_columns
         
-        # Don't forget the last group
         if len(current_group) > 1:
             logger.info(f"Merging final {len(current_group)} tables")
             merged_df = pd.concat(current_group, ignore_index=True)
@@ -236,7 +219,7 @@ class PDFtoCSVConverter:
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
-        dataframes = []
+        dataframes: List[pd.DataFrame] = []
         
         if method == 'auto':
             logger.info("Using auto mode: trying multiple extraction methods")
@@ -261,13 +244,11 @@ class PDFtoCSVConverter:
             logger.warning("No tables extracted from PDF")
             return []
         
-        # Try to merge tables with same structure before cleaning
         if len(dataframes) > 1:
             dataframes = self.merge_similar_tables(dataframes)
         
         if clean:
             dataframes = [self.clean_dataframe(df) for df in dataframes if not df.empty]
-            # Remove any empty dataframes after cleaning
             dataframes = [df for df in dataframes if not df.empty]
         
         base_name = pdf_path.stem
