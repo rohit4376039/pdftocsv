@@ -86,6 +86,7 @@ if uploaded_file is not None:
                 else:
                     st.error("❌ No tables found in the PDF")
                     
-            except Exception as e:
+             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
-                st.code(traceback.format_exc())
+                st.text("Details:")
+                st.text(traceback.format_exc())
