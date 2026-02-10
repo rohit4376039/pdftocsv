@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class PDFtoCSVConverter:
     """
-    Robust PDF → CSV converter with multi‑page handling.
+    Robust PDF → CSV converter with per‑page tables and safe merging.
     """
 
     def __init__(self, output_dir: str = "./output"):
@@ -52,17 +52,14 @@ class PDFtoCSVConverter:
 
     def extract_with_pdfplumber(self, pdf_path: str) -> List[pd.DataFrame]:
         """
-        Pdfplumber extraction, page‑by‑page to keep memory low,
-        and stitching tables that continue across pages.
+        Pdfplumber extraction, page‑by‑page to keep memory low.
+        Each page/table is treated independently (no cross‑page stitching).
         """
         try:
             import pdfplumber
 
-            logger.info(f"Extracting with pdfplumber (streaming) from {pdf_path}")
+            logger.info(f"Extracting with pdfplumber (per‑page) from {pdf_path}")
             all_tables: List[pd.DataFrame] = []
-
-            current_headers = None
-            current_table_data: List[List] = []
 
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
@@ -75,40 +72,16 @@ class PDFtoCSVConverter:
                         header_row = table[0]
                         body_rows = table[1:]
 
-                        if current_headers is None:
-                            # first table
-                            current_headers = header_row
-                            current_table_data = body_rows
-                            logger.info(f"Started table on page {page_num}")
-                        elif self._is_same_table(current_headers, header_row):
-                            # continuation of same table
-                            current_table_data.extend(body_rows)
-                            logger.info(
-                                f"Continued table on page {page_num}, added {len(body_rows)} rows"
-                            )
-                        else:
-                            # flush previous table and start new
-                            if current_table_data:
-                                df = pd.DataFrame(current_table_data, columns=current_headers)
-                                all_tables.append(df)
-                                logger.info(
-                                    f"Completed table with {len(current_table_data)} rows"
-                                )
-                            current_headers = header_row
-                            current_table_data = body_rows
-                            logger.info(f"Started new table on page {page_num}")
+                        df = pd.DataFrame(body_rows, columns=header_row)
+                        all_tables.append(df)
+                        logger.info(
+                            f"Extracted table on page {page_num} with {len(body_rows)} rows"
+                        )
 
-                    # free per‑page resources
                     try:
                         page.flush_cache()
                     except Exception:
                         pass
-
-            # flush last table
-            if current_headers is not None and current_table_data:
-                df = pd.DataFrame(current_table_data, columns=current_headers)
-                all_tables.append(df)
-                logger.info(f"Completed final table with {len(current_table_data)} rows")
 
             logger.info(f"pdfplumber extracted {len(all_tables)} tables total")
             return all_tables
@@ -120,21 +93,8 @@ class PDFtoCSVConverter:
     # ---------- HELPERS ----------
 
     def _is_same_table(self, headers1: List, headers2: List) -> bool:
-        """Heuristic: are these header rows for the same table?"""
-        h1 = [str(h).strip().lower() for h in headers1]
-        h2 = [str(h).strip().lower() for h in headers2]
-
-        if len(h1) != len(h2):
-            return False
-
-        matches = 0
-        for a, b in zip(h1, h2):
-            if a == b:
-                matches += 1
-            elif len(a) > 2 and len(b) > 2 and (a in b or b in a):
-                matches += 1
-
-        return (matches / len(h1)) >= 0.7 if h1 else False
+        """Treat each page/table as independent to avoid misalignment."""
+        return False
 
     def remove_duplicate_headers(self, df: pd.DataFrame) -> pd.DataFrame:
         """Drop rows that look like a repeat of the header row."""
@@ -173,9 +133,6 @@ class PDFtoCSVConverter:
             if df.empty:
                 return df
 
-        # Decide how many top rows to treat as header fragments
-        non_nan_counts = header_block.notna().sum(axis=1)
-        # Heuristic: at least 2 rows near the top are header-like
         header_rows = header_block.index.tolist()
         if len(header_rows) <= 1:
             return df
@@ -187,28 +144,21 @@ class PDFtoCSVConverter:
             col_name = " ".join(tokens).strip()
             new_cols.append(col_name or f"col_{col_idx}")
 
-        # Drop the header rows and assign combined header
         df = df.iloc[len(header_rows):].reset_index(drop=True)
         df.columns = new_cols
         return df
 
     def clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Cleanup + fix stacked headers like in the screenshot."""
-        # First, try to flatten multi‑row headers
+        """Cleanup + fix stacked headers."""
         df = self._flatten_multirow_header(df)
-
-        # Remove duplicate header rows that may still remain
         df = self.remove_duplicate_headers(df)
 
-        # Drop all‑NaN rows/cols
         df = df.dropna(how="all").dropna(axis=1, how="all")
 
-        # Drop rows that are all empty strings
         df = df[
             ~df.apply(lambda row: all(str(val).strip() == "" for val in row), axis=1)
         ]
 
-        # Normalize all cells to stripped strings
         for col in df.columns:
             df[col] = df[col].apply(lambda v: str(v).strip())
             df[col] = df[col].replace("nan", "")
@@ -216,31 +166,46 @@ class PDFtoCSVConverter:
         return df.reset_index(drop=True)
 
     def merge_similar_tables(self, dfs: List[pd.DataFrame]) -> List[pd.DataFrame]:
-        """Merge consecutive tables that share the same set of columns."""
+        """
+        Merge tables that have the same logical columns.
+        Align columns by name and fill missing ones with empty strings
+        so page breaks do not shift cells or drop values.
+        """
         if len(dfs) <= 1:
             return dfs
 
+        def norm_cols(df: pd.DataFrame):
+            return tuple(str(c).strip().lower() for c in df.columns)
+
+        groups = {}
+        for df in dfs:
+            key = norm_cols(df)
+            groups.setdefault(key, []).append(df)
+
         merged: List[pd.DataFrame] = []
-        current_group = [dfs[0]]
-        current_cols = set(str(c).strip().lower() for c in dfs[0].columns)
+        for key, group in groups.items():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
 
-        for df in dfs[1:]:
-            cols = set(str(c).strip().lower() for c in df.columns)
-            if cols == current_cols:
-                current_group.append(df)
-            else:
-                if len(current_group) > 1:
-                    merged.append(pd.concat(current_group, ignore_index=True))
-                else:
-                    merged.append(current_group[0])
-                current_group = [df]
-                current_cols = cols
+            # Union of all columns across the group
+            all_cols = []
+            for df in group:
+                for c in df.columns:
+                    if c not in all_cols:
+                        all_cols.append(c)
 
-        # flush last group
-        if len(current_group) > 1:
-            merged.append(pd.concat(current_group, ignore_index=True))
-        else:
-            merged.append(current_group[0])
+            aligned = []
+            for df in group:
+                tmp = df.copy()
+                for c in all_cols:
+                    if c not in tmp.columns:
+                        tmp[c] = ""
+                tmp = tmp[all_cols]
+                aligned.append(tmp)
+
+            merged_df = pd.concat(aligned, ignore_index=True)
+            merged.append(merged_df)
 
         return merged
 
