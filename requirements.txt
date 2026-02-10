@@ -1,0 +1,6 @@
+streamlit
+pandas
+pdfplumber
+camelot-py[cv]
+tabula-py
+PyPDF2==2.12.1
