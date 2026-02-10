@@ -168,16 +168,10 @@ class PDFtoCSVConverter:
             ~df.apply(lambda row: all(str(val).strip() == "" for val in row), axis=1)
         ]
 
-        # normalize non‑numeric columns, without ever using df[col].dtype directly
+        # normalize every column to stripped strings (no .dtype, no .str)
         for col in df.columns:
-            s = df[col]
-            try:
-                if not pd.api.types.is_numeric_dtype(s):
-                    s = s.astype(str).str.strip()
-                    s = s.replace("nan", "")
-                    df[col] = s
-            except Exception:
-                df[col] = s.astype(str).str.strip()
+            df[col] = df[col].apply(lambda v: str(v).strip())
+            df[col] = df[col].replace("nan", "")
 
         return df.reset_index(drop=True)
 
