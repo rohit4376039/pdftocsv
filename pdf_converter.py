@@ -20,6 +20,7 @@ class PDFtoCSVConverter:
     # ---------- EXTRACTORS ----------
 
     def extract_with_camelot(self, pdf_path: str, pages: str = "all") -> List[pd.DataFrame]:
+        """Extract tables using Camelot."""
         try:
             import camelot
 
@@ -37,6 +38,7 @@ class PDFtoCSVConverter:
             return []
 
     def extract_with_tabula(self, pdf_path: str, pages: str = "all") -> List[pd.DataFrame]:
+        """Extract tables using Tabula."""
         try:
             import tabula
 
@@ -60,7 +62,7 @@ class PDFtoCSVConverter:
             all_tables: List[pd.DataFrame] = []
 
             current_headers = None
-            current_table_data = []
+            current_table_data: List[List] = []
 
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
@@ -166,11 +168,16 @@ class PDFtoCSVConverter:
             ~df.apply(lambda row: all(str(val).strip() == "" for val in row), axis=1)
         ]
 
-        # normalize object columns
+        # normalize non‑numeric columns, without ever using df[col].dtype directly
         for col in df.columns:
-            if df[col].dtype == "object":
-                df[col] = df[col].astype(str).str.strip()
-                df[col] = df[col].replace("nan", "")
+            s = df[col]
+            try:
+                if not pd.api.types.is_numeric_dtype(s):
+                    s = s.astype(str).str.strip()
+                    s = s.replace("nan", "")
+                    df[col] = s
+            except Exception:
+                df[col] = s.astype(str).str.strip()
 
         return df.reset_index(drop=True)
 
